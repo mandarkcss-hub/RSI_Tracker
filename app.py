@@ -1,12 +1,29 @@
 import time
+import threading
 import requests
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from flask import Flask, jsonify, render_template_string
 
 
 app = Flask(__name__)
+
+
+# ============================================================
+# GLOBAL CACHE / SCANNER STATE
+# ============================================================
+
+latest_rows = []
+
+latest_scan_time = None
+
+latest_scan_duration = None
+
+scanner_running = False
+
+scanner_error = None
+
+data_lock = threading.Lock()
 
 
 # ============================================================
@@ -33,13 +50,15 @@ CURRENT_PRICES_URL = (
 
 CANDLE_COUNT = 200
 
-MAX_WORKERS = 12
+MAX_WORKERS = 4
+
+BACKGROUND_SCAN_PAUSE = 15
 
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "CoinDCX-Futures-RSI-Scanner/1.1"
+    "User-Agent": "CoinDCX-Futures-RSI-Scanner/1.2"
 })
 
 
@@ -230,7 +249,9 @@ def get_rsi(pair, resolution):
                 candle["close"]
             )
 
-            closes.append(close)
+            closes.append(
+                close
+            )
 
         except (
             KeyError,
@@ -247,7 +268,7 @@ def get_rsi(pair, resolution):
 
 
 # ============================================================
-# GET CURRENT PRICES
+# GET CURRENT FUTURES PRICES
 # ============================================================
 
 def get_current_prices():
@@ -286,7 +307,7 @@ def coin_name(pair):
 
 
 # ============================================================
-# PROCESS ONE FUTURES PAIR
+# PROCESS ONE PAIR
 # ============================================================
 
 def process_pair(pair, prices):
@@ -309,7 +330,7 @@ def process_pair(pair, prices):
             )
 
         # ----------------------------------------
-        # EXACT SAME RSI LOGIC
+        # SAME RSI LOGIC AS BEFORE
         # ----------------------------------------
 
         rsi_5m = get_rsi(
@@ -369,10 +390,6 @@ def build_scanner():
     )
     print()
 
-    # ========================================================
-    # PROCESS MULTIPLE COINS SIMULTANEOUSLY
-    # ========================================================
-
     with ThreadPoolExecutor(
         max_workers=MAX_WORKERS
     ) as executor:
@@ -406,10 +423,6 @@ def build_scanner():
                     f"{pair}: {error}"
                 )
 
-    # ========================================================
-    # SORT BY 5-MINUTE RSI DESCENDING
-    # ========================================================
-
     rows.sort(
         key=lambda x: (
             x["rsi_5m"]
@@ -438,10 +451,65 @@ def build_scanner():
     print(
         "=============================================="
     )
-
     print()
 
-    return rows
+    return rows, elapsed
+
+
+# ============================================================
+# BACKGROUND SCANNER
+# ============================================================
+
+def background_scanner():
+
+    global latest_rows
+    global latest_scan_time
+    global latest_scan_duration
+    global scanner_running
+    global scanner_error
+
+    while True:
+
+        try:
+
+            scanner_running = True
+
+            scanner_error = None
+
+            rows, elapsed = build_scanner()
+
+            with data_lock:
+
+                latest_rows = rows
+
+                latest_scan_time = int(
+                    time.time()
+                )
+
+                latest_scan_duration = elapsed
+
+            scanner_running = False
+
+        except Exception as error:
+
+            scanner_running = False
+
+            scanner_error = str(
+                error
+            )
+
+            print()
+            print(
+                "Background scanner error:"
+            )
+            print(
+                error
+            )
+            print()
+
+        time.sleep(
+            BACKGROUND_SCAN_PAUSE
+        )
 
 
 # ============================================================
@@ -451,30 +519,40 @@ def build_scanner():
 @app.route("/api/data")
 def api_data():
 
-    try:
+    with data_lock:
 
-        rows = build_scanner()
-
-        return jsonify({
-            "success": True,
-            "timestamp": int(
-                time.time()
-            ),
-            "count": len(rows),
-            "data": rows
-        })
-
-    except Exception as error:
-
-        print(
-            f"/api/data error: "
-            f"{error}"
+        rows = list(
+            latest_rows
         )
 
-        return jsonify({
-            "success": False,
-            "error": str(error)
-        }), 500
+        scan_time = (
+            latest_scan_time
+        )
+
+        scan_duration = (
+            latest_scan_duration
+        )
+
+        running = (
+            scanner_running
+        )
+
+        error = (
+            scanner_error
+        )
+
+    return jsonify({
+        "success": True,
+        "timestamp": int(
+            time.time()
+        ),
+        "count": len(rows),
+        "data": rows,
+        "last_scan_time": scan_time,
+        "scan_duration": scan_duration,
+        "scanner_running": running,
+        "scanner_error": error
+    })
 
 
 # ============================================================
@@ -568,7 +646,7 @@ input {
 
     width: 250px;
 
-    max-width: 80%;
+    max-width: 75%;
 
     padding: 10px;
 
@@ -594,6 +672,41 @@ button {
     border-radius: 6px;
 
     cursor: pointer;
+
+}
+
+
+.status {
+
+    padding:
+        12px 15px;
+
+    background: #f9fafb;
+
+    font-size: 13px;
+
+    color: #555;
+
+}
+
+
+.status.loading {
+
+    color: #1d4ed8;
+
+}
+
+
+.status.success {
+
+    color: #166534;
+
+}
+
+
+.status.error {
+
+    color: #b91c1c;
 
 }
 
@@ -648,41 +761,6 @@ td {
 .coin {
 
     font-weight: bold;
-
-}
-
-
-.status {
-
-    padding:
-        12px 15px;
-
-    background: #f9fafb;
-
-    font-size: 13px;
-
-    color: #555;
-
-}
-
-
-.loading {
-
-    color: #1d4ed8;
-
-}
-
-
-.error {
-
-    color: #b91c1c;
-
-}
-
-
-.success {
-
-    color: #166534;
 
 }
 
@@ -757,7 +835,7 @@ td {
     id="status"
 >
 
-    Loading...
+    Starting scanner...
 
 </div>
 
@@ -837,11 +915,31 @@ function formatRSI(value) {
 }
 
 
+function formatBackendTime(timestamp) {
+
+    if (
+        timestamp === null ||
+        timestamp === undefined
+    ) {
+
+        return "-";
+
+    }
+
+    return new Date(
+        timestamp * 1000
+    ).toLocaleTimeString();
+
+}
+
+
 function render() {
 
     const search =
         document
-        .getElementById("search")
+        .getElementById(
+            "search"
+        )
         .value
         .toUpperCase()
         .trim();
@@ -915,18 +1013,6 @@ async function loadData() {
         );
 
 
-    status.className =
-        "status loading";
-
-
-    status.innerText =
-        "Updating Futures data...";
-
-
-    const startTime =
-        Date.now();
-
-
     try {
 
         const response =
@@ -987,32 +1073,101 @@ async function loadData() {
         render();
 
 
-        const now =
+        const pageTime =
             new Date()
             .toLocaleTimeString();
 
 
-        const seconds =
-            (
-                (
-                    Date.now()
-                    - startTime
-                )
-                / 1000
-            )
-            .toFixed(1);
+        let statusText =
+            `Showing ${result.count} active Futures coins`;
 
 
-        status.className =
-            "status success";
+        if (
+            result.last_scan_time
+        ) {
+
+            statusText +=
+                ` • Last completed scan: `
+                +
+                formatBackendTime(
+                    result.last_scan_time
+                );
+
+        }
+
+
+        if (
+            result.scan_duration !== null
+            &&
+            result.scan_duration !== undefined
+        ) {
+
+            statusText +=
+                ` • Scan time: `
+                +
+                Number(
+                    result.scan_duration
+                ).toFixed(1)
+                +
+                `s`;
+
+        }
+
+
+        if (
+            result.scanner_running
+        ) {
+
+            statusText +=
+                ` • Updating in background...`;
+
+        }
+
+
+        statusText +=
+            ` • Page checked: ${pageTime}`;
+
+
+        if (
+            result.scanner_error
+        ) {
+
+            status.className =
+                "status error";
+
+
+            statusText +=
+                ` • Scanner error: `
+                +
+                result.scanner_error;
+
+        }
+
+        else if (
+            result.count === 0
+        ) {
+
+            status.className =
+                "status loading";
+
+
+            statusText =
+                "Background scanner is running. "
+                +
+                "Waiting for first complete scan...";
+
+        }
+
+        else {
+
+            status.className =
+                "status success";
+
+        }
 
 
         status.innerText =
-            `Showing ${result.count} active Futures coins`
-            +
-            ` • Last update: ${now}`
-            +
-            ` • Scan: ${seconds}s`;
+            statusText;
 
     }
 
@@ -1024,13 +1179,15 @@ async function loadData() {
 
         status.innerText =
             "Error: "
-            + error.message;
+            +
+            error.message;
 
     }
 
     finally {
 
-        requestRunning = false;
+        requestRunning =
+            false;
 
     }
 
@@ -1076,6 +1233,18 @@ refreshLoop();
 
 
 # ============================================================
+# START BACKGROUND SCANNER
+# ============================================================
+
+scanner_thread = threading.Thread(
+    target=background_scanner,
+    daemon=True
+)
+
+scanner_thread.start()
+
+
+# ============================================================
 # HOME PAGE
 # ============================================================
 
@@ -1104,7 +1273,7 @@ if __name__ == "__main__":
     )
 
     print(
-        " Version 1.1 - Concurrent"
+        " Version 1.2 - Background Cache"
     )
 
     print(
