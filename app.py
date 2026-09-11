@@ -1,17 +1,17 @@
 import time
-import math
 import requests
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from flask import Flask, jsonify, render_template_string
 
-# ============================================================
-# COINDCX FUTURES RSI SCANNER - VERSION 1
-# ============================================================
 
 app = Flask(__name__)
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
+
+# ============================================================
+# COINDCX API URLS
+# ============================================================
 
 ACTIVE_INSTRUMENTS_URL = (
     "https://api.coindcx.com/exchange/v1/derivatives/"
@@ -26,28 +26,26 @@ CURRENT_PRICES_URL = (
     "https://public.coindcx.com/market_data/v3/current_prices/futures/rt"
 )
 
-# How many candles we request for RSI calculation.
-# 200 gives RSI enough historical data to stabilize.
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
 CANDLE_COUNT = 200
 
-# Refresh interval for the browser, in milliseconds.
-REFRESH_INTERVAL = 15000  # 15 seconds
+MAX_WORKERS = 12
 
-
-# ------------------------------------------------------------
-# HTTP session
-# ------------------------------------------------------------
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "CoinDCX-Futures-RSI-Scanner/1.0"
+    "User-Agent": "CoinDCX-Futures-RSI-Scanner/1.1"
 })
 
 
-# ------------------------------------------------------------
-# Get active USDT Futures instruments
-# ------------------------------------------------------------
+# ============================================================
+# GET ACTIVE FUTURES
+# ============================================================
 
 def get_active_futures():
 
@@ -65,7 +63,6 @@ def get_active_futures():
 
     instruments = response.json()
 
-    # Keep only valid strings
     instruments = [
         x for x in instruments
         if isinstance(x, str)
@@ -74,28 +71,25 @@ def get_active_futures():
     return sorted(instruments)
 
 
-# ------------------------------------------------------------
-# Get Futures candles
-#
-# CoinDCX:
-# resolution = 5  -> 5 minute
-# resolution = 15 -> 15 minute
-# pcode = f        -> Futures
-# ------------------------------------------------------------
+# ============================================================
+# GET CANDLES
+# ============================================================
 
 def get_candles(pair, resolution):
 
     now = int(time.time())
 
-    # Approximate number of seconds required.
     if resolution == 5:
         seconds_per_candle = 5 * 60
+
     elif resolution == 15:
         seconds_per_candle = 15 * 60
-    else:
-        raise ValueError("Unsupported resolution")
 
-    # Ask for substantially more history than RSI requires.
+    else:
+        raise ValueError(
+            "Unsupported resolution"
+        )
+
     from_time = now - (
         CANDLE_COUNT * seconds_per_candle
     )
@@ -121,29 +115,36 @@ def get_candles(pair, resolution):
     if not isinstance(result, dict):
         return []
 
-    candles = result.get("data", [])
+    candles = result.get(
+        "data",
+        []
+    )
 
-    # Sort oldest -> newest
     candles.sort(
-        key=lambda x: x.get("time", 0)
+        key=lambda x: x.get(
+            "time",
+            0
+        )
     )
 
     return candles
 
 
-# ------------------------------------------------------------
-# RSI(14) - Wilder's RSI
-# ------------------------------------------------------------
+# ============================================================
+# RSI CALCULATION
+# ============================================================
 
 def calculate_rsi(closes, period=14):
 
     if len(closes) < period + 1:
         return None
 
-    # Calculate price changes
     changes = []
 
-    for i in range(1, len(closes)):
+    for i in range(
+        1,
+        len(closes)
+    ):
         changes.append(
             closes[i] - closes[i - 1]
         )
@@ -158,29 +159,37 @@ def calculate_rsi(closes, period=14):
         for change in changes
     ]
 
-    # Initial averages
-    avg_gain = sum(
-        gains[:period]
-    ) / period
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    avg_loss = sum(
-        losses[:period]
-    ) / period
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
 
-    # Wilder smoothing
-    for i in range(period, len(gains)):
+    for i in range(
+        period,
+        len(gains)
+    ):
 
         avg_gain = (
-            (avg_gain * (period - 1))
+            (
+                avg_gain
+                * (period - 1)
+            )
             + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
+            (
+                avg_loss
+                * (period - 1)
+            )
             + losses[i]
         ) / period
 
-    # Handle special cases
     if avg_loss == 0:
 
         if avg_gain == 0:
@@ -197,9 +206,9 @@ def calculate_rsi(closes, period=14):
     return rsi
 
 
-# ------------------------------------------------------------
-# Get RSI from candles
-# ------------------------------------------------------------
+# ============================================================
+# GET RSI
+# ============================================================
 
 def get_rsi(pair, resolution):
 
@@ -216,13 +225,19 @@ def get_rsi(pair, resolution):
     for candle in candles:
 
         try:
+
             close = float(
                 candle["close"]
             )
 
             closes.append(close)
 
-        except (KeyError, TypeError, ValueError):
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
+
             continue
 
     return calculate_rsi(
@@ -231,9 +246,9 @@ def get_rsi(pair, resolution):
     )
 
 
-# ------------------------------------------------------------
-# Get current Futures prices
-# ------------------------------------------------------------
+# ============================================================
+# GET CURRENT PRICES
+# ============================================================
 
 def get_current_prices():
 
@@ -247,16 +262,14 @@ def get_current_prices():
     return response.json()
 
 
-# ------------------------------------------------------------
-# Convert pair into readable coin name
-#
-# Example:
-# B-BTC_USDT -> BTC
-# ------------------------------------------------------------
+# ============================================================
+# CLEAN COIN NAME
+# ============================================================
 
 def coin_name(pair):
 
     try:
+
         value = pair
 
         if value.startswith("B-"):
@@ -268,35 +281,80 @@ def coin_name(pair):
         return value
 
     except Exception:
+
         return pair
 
 
-# ------------------------------------------------------------
-# Signal based on 5-minute RSI
-# ------------------------------------------------------------
+# ============================================================
+# PROCESS ONE FUTURES PAIR
+# ============================================================
 
-def get_signal(rsi):
+def process_pair(pair, prices):
 
-    if rsi is None:
-        return ""
+    try:
 
-    if rsi >= 94:
-        return "SHORT ZONE"
+        price_info = prices.get(
+            pair,
+            {}
+        )
 
-    if rsi >= 93:
-        return "APPROACHING"
+        current_price = (
+            price_info.get("ls")
+        )
 
-    if rsi >= 87:
-        return "WATCH"
+        if current_price is not None:
 
-    return ""
+            current_price = float(
+                current_price
+            )
+
+        # ----------------------------------------
+        # EXACT SAME RSI LOGIC
+        # ----------------------------------------
+
+        rsi_5m = get_rsi(
+            pair,
+            5
+        )
+
+        rsi_15m = get_rsi(
+            pair,
+            15
+        )
+
+        print(
+            f"{pair:25} "
+            f"5m="
+            f"{rsi_5m if rsi_5m is not None else '-':>6} "
+            f"15m="
+            f"{rsi_15m if rsi_15m is not None else '-':>6}"
+        )
+
+        return {
+            "pair": pair,
+            "coin": coin_name(pair),
+            "price": current_price,
+            "rsi_5m": rsi_5m,
+            "rsi_15m": rsi_15m
+        }
+
+    except Exception as error:
+
+        print(
+            f"Error processing "
+            f"{pair}: {error}"
+        )
+
+        return None
 
 
-# ------------------------------------------------------------
-# Build scanner data
-# ------------------------------------------------------------
+# ============================================================
+# BUILD COMPLETE SCANNER
+# ============================================================
 
 def build_scanner():
+
+    start_time = time.time()
 
     instruments = get_active_futures()
 
@@ -304,56 +362,54 @@ def build_scanner():
 
     rows = []
 
-    for pair in instruments:
+    print()
+    print(
+        f"Starting scan for "
+        f"{len(instruments)} Futures coins..."
+    )
+    print()
 
-        try:
+    # ========================================================
+    # PROCESS MULTIPLE COINS SIMULTANEOUSLY
+    # ========================================================
 
-            # Current price
-            price_info = prices.get(pair, {})
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
 
-            current_price = price_info.get(
-                "ls"
-            )
+        futures = {
+            executor.submit(
+                process_pair,
+                pair,
+                prices
+            ): pair
+            for pair in instruments
+        }
 
-            if current_price is not None:
-                current_price = float(
-                    current_price
+        for future in as_completed(
+            futures
+        ):
+
+            pair = futures[future]
+
+            try:
+
+                result = future.result()
+
+                if result is not None:
+                    rows.append(result)
+
+            except Exception as error:
+
+                print(
+                    f"Thread error "
+                    f"{pair}: {error}"
                 )
 
-            # 5-minute RSI
-            rsi_5m = get_rsi(
-                pair,
-                5
-            )
+    # ========================================================
+    # SORT BY 5-MINUTE RSI DESCENDING
+    # ========================================================
 
-            # 15-minute RSI
-            rsi_15m = get_rsi(
-                pair,
-                15
-            )
-
-            rows.append({
-                "pair": pair,
-                "coin": coin_name(pair),
-                "price": current_price,
-                "rsi_5m": rsi_5m,
-                "rsi_15m": rsi_15m,
-                "signal": get_signal(rsi_5m)
-            })
-
-            print(
-                f"{pair:25} "
-                f"5m={rsi_5m if rsi_5m is not None else '-':>6} "
-                f"15m={rsi_15m if rsi_15m is not None else '-':>6}"
-            )
-
-        except Exception as error:
-
-            print(
-                f"Error processing {pair}: {error}"
-            )
-
-    # Highest 5m RSI first
     rows.sort(
         key=lambda x: (
             x["rsi_5m"]
@@ -363,12 +419,34 @@ def build_scanner():
         reverse=True
     )
 
+    elapsed = (
+        time.time()
+        - start_time
+    )
+
+    print()
+    print(
+        "=============================================="
+    )
+
+    print(
+        f"Scanner completed: "
+        f"{len(rows)} coins in "
+        f"{elapsed:.2f} seconds"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    print()
+
     return rows
 
 
-# ------------------------------------------------------------
-# API endpoint
-# ------------------------------------------------------------
+# ============================================================
+# API
+# ============================================================
 
 @app.route("/api/data")
 def api_data():
@@ -379,12 +457,19 @@ def api_data():
 
         return jsonify({
             "success": True,
-            "timestamp": int(time.time()),
+            "timestamp": int(
+                time.time()
+            ),
             "count": len(rows),
             "data": rows
         })
 
     except Exception as error:
+
+        print(
+            f"/api/data error: "
+            f"{error}"
+        )
 
         return jsonify({
             "success": False,
@@ -392,9 +477,9 @@ def api_data():
         }), 500
 
 
-# ------------------------------------------------------------
-# Web interface
-# ------------------------------------------------------------
+# ============================================================
+# HTML DASHBOARD
+# ============================================================
 
 HTML = r"""
 <!DOCTYPE html>
@@ -405,132 +490,225 @@ HTML = r"""
 
 <meta charset="UTF-8">
 
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
 
-<title>CoinDCX Futures RSI Scanner</title>
+<title>
+CoinDCX Futures RSI Scanner
+</title>
+
 
 <style>
 
 body {
-    font-family: Arial, sans-serif;
+
+    font-family:
+        Arial,
+        sans-serif;
+
     margin: 0;
+
     padding: 0;
+
     background: #f4f5f7;
+
     color: #222;
+
 }
+
 
 .header {
+
     background: #111827;
+
     color: white;
+
     padding: 18px;
+
 }
+
 
 .header h1 {
+
     margin: 0 0 8px 0;
+
     font-size: 22px;
+
 }
+
 
 .header small {
+
     color: #cbd5e1;
+
 }
+
 
 .controls {
+
     padding: 15px;
+
     background: white;
+
     position: sticky;
+
     top: 0;
+
     z-index: 10;
-    border-bottom: 1px solid #ddd;
+
+    border-bottom:
+        1px solid #ddd;
+
 }
+
 
 input {
+
     width: 250px;
+
     max-width: 80%;
+
     padding: 10px;
-    border: 1px solid #ccc;
+
+    border:
+        1px solid #ccc;
+
     border-radius: 6px;
+
     font-size: 15px;
+
 }
+
 
 button {
-    padding: 10px 14px;
+
+    padding:
+        10px 14px;
+
     margin-left: 8px;
+
     border: none;
+
     border-radius: 6px;
+
     cursor: pointer;
+
 }
+
 
 table {
+
     width: 100%;
-    border-collapse: collapse;
+
+    border-collapse:
+        collapse;
+
     background: white;
+
 }
 
+
 th {
+
     background: #e5e7eb;
+
     padding: 12px;
+
     text-align: right;
+
     position: sticky;
+
     top: 74px;
+
 }
+
 
 th:first-child,
 td:first-child {
+
     text-align: left;
+
 }
+
 
 td {
+
     padding: 11px;
-    border-bottom: 1px solid #eee;
+
+    border-bottom:
+        1px solid #eee;
+
     text-align: right;
+
 }
+
 
 .coin {
+
     font-weight: bold;
+
 }
 
-.rsi-high {
-    font-weight: bold;
-}
-
-.rsi-short {
-    background: #fee2e2;
-    color: #991b1b;
-    font-weight: bold;
-}
-
-.rsi-approaching {
-    background: #ffedd5;
-    color: #9a3412;
-    font-weight: bold;
-}
-
-.rsi-watch {
-    background: #fef9c3;
-    color: #854d0e;
-    font-weight: bold;
-}
 
 .status {
-    padding: 12px 15px;
+
+    padding:
+        12px 15px;
+
     background: #f9fafb;
+
     font-size: 13px;
+
     color: #555;
+
 }
+
+
+.loading {
+
+    color: #1d4ed8;
+
+}
+
+
+.error {
+
+    color: #b91c1c;
+
+}
+
+
+.success {
+
+    color: #166534;
+
+}
+
 
 @media(max-width:700px) {
 
     table {
+
         font-size: 13px;
+
     }
 
-    th, td {
-        padding: 8px 6px;
+
+    th,
+    td {
+
+        padding:
+            8px 6px;
+
     }
+
 
     .header h1 {
+
         font-size: 18px;
+
     }
 
 }
@@ -539,11 +717,15 @@ td {
 
 </head>
 
+
 <body>
+
 
 <div class="header">
 
-    <h1>CoinDCX Futures RSI Scanner</h1>
+    <h1>
+        CoinDCX Futures RSI Scanner
+    </h1>
 
     <small>
         Futures only • RSI(14) • 5m + 15m
@@ -561,15 +743,22 @@ td {
         oninput="render()"
     >
 
-    <button onclick="loadData()">
+    <button
+        onclick="manualRefresh()"
+    >
         Refresh
     </button>
 
 </div>
 
 
-<div class="status" id="status">
+<div
+    class="status"
+    id="status"
+>
+
     Loading...
+
 </div>
 
 
@@ -587,28 +776,34 @@ td {
 
 <th>RSI 15m</th>
 
-<th>Signal</th>
-
 </tr>
 
 </thead>
 
-<tbody id="tableBody">
 
+<tbody
+    id="tableBody"
+>
 </tbody>
+
 
 </table>
 
 
 <script>
 
+
 let allData = [];
+
+let requestRunning = false;
 
 
 function formatPrice(value) {
 
-    if (value === null ||
-        value === undefined) {
+    if (
+        value === null ||
+        value === undefined
+    ) {
 
         return "-";
 
@@ -621,13 +816,16 @@ function formatPrice(value) {
                 maximumFractionDigits: 8
             }
         );
+
 }
 
 
 function formatRSI(value) {
 
-    if (value === null ||
-        value === undefined) {
+    if (
+        value === null ||
+        value === undefined
+    ) {
 
         return "-";
 
@@ -635,37 +833,6 @@ function formatRSI(value) {
 
     return Number(value)
         .toFixed(2);
-}
-
-
-function rsiClass(value) {
-
-    if (value === null ||
-        value === undefined) {
-
-        return "";
-
-    }
-
-    if (value >= 94) {
-
-        return "rsi-short";
-
-    }
-
-    if (value >= 93) {
-
-        return "rsi-approaching";
-
-    }
-
-    if (value >= 87) {
-
-        return "rsi-watch";
-
-    }
-
-    return "";
 
 }
 
@@ -679,21 +846,24 @@ function render() {
         .toUpperCase()
         .trim();
 
+
     const filtered =
-        allData.filter(row =>
-            row.coin
-            .toUpperCase()
-            .includes(search)
+        allData.filter(
+            row =>
+                row.coin
+                .toUpperCase()
+                .includes(search)
         );
 
 
     let html = "";
 
 
-    for (const row of filtered) {
+    for (
+        const row of filtered
+    ) {
 
         html += `
-
         <tr>
 
             <td class="coin">
@@ -704,7 +874,7 @@ function render() {
                 ${formatPrice(row.price)}
             </td>
 
-            <td class="${rsiClass(row.rsi_5m)}">
+            <td>
                 ${formatRSI(row.rsi_5m)}
             </td>
 
@@ -712,19 +882,16 @@ function render() {
                 ${formatRSI(row.rsi_15m)}
             </td>
 
-            <td>
-                ${row.signal}
-            </td>
-
         </tr>
-
         `;
 
     }
 
 
     document
-        .getElementById("tableBody")
+        .getElementById(
+            "tableBody"
+        )
         .innerHTML = html;
 
 }
@@ -732,16 +899,72 @@ function render() {
 
 async function loadData() {
 
-    document
-        .getElementById("status")
-        .innerText =
+    if (requestRunning) {
+
+        return;
+
+    }
+
+
+    requestRunning = true;
+
+
+    const status =
+        document.getElementById(
+            "status"
+        );
+
+
+    status.className =
+        "status loading";
+
+
+    status.innerText =
         "Updating Futures data...";
+
+
+    const startTime =
+        Date.now();
 
 
     try {
 
         const response =
-            await fetch("/api/data");
+            await fetch(
+                "/api/data",
+                {
+                    cache: "no-store"
+                }
+            );
+
+
+        const contentType =
+            response.headers.get(
+                "content-type"
+            );
+
+
+        if (
+            !contentType ||
+            !contentType.includes(
+                "application/json"
+            )
+        ) {
+
+            const text =
+                await response.text();
+
+
+            throw new Error(
+                "Server returned non-JSON response. "
+                +
+                text.substring(
+                    0,
+                    100
+                )
+            );
+
+        }
 
 
         const result =
@@ -769,35 +992,82 @@ async function loadData() {
             .toLocaleTimeString();
 
 
-        document
-            .getElementById("status")
-            .innerText =
-            `Showing ${result.count} active Futures coins • Last update: ${now}`;
+        const seconds =
+            (
+                (
+                    Date.now()
+                    - startTime
+                )
+                / 1000
+            )
+            .toFixed(1);
 
 
-    } catch (error) {
+        status.className =
+            "status success";
 
-        document
-            .getElementById("status")
-            .innerText =
-            "Error: " + error.message;
+
+        status.innerText =
+            `Showing ${result.count} active Futures coins`
+            +
+            ` • Last update: ${now}`
+            +
+            ` • Scan: ${seconds}s`;
+
+    }
+
+    catch (error) {
+
+        status.className =
+            "status error";
+
+
+        status.innerText =
+            "Error: "
+            + error.message;
+
+    }
+
+    finally {
+
+        requestRunning = false;
 
     }
 
 }
 
 
-// Initial load
-loadData();
+async function refreshLoop() {
+
+    await loadData();
 
 
-// Automatic refresh
-setInterval(
-    loadData,
-    15000
-);
+    setTimeout(
+        refreshLoop,
+        15000
+    );
+
+}
+
+
+async function manualRefresh() {
+
+    if (
+        !requestRunning
+    ) {
+
+        await loadData();
+
+    }
+
+}
+
+
+refreshLoop();
+
 
 </script>
+
 
 </body>
 
@@ -805,9 +1075,9 @@ setInterval(
 """
 
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+# ============================================================
+# HOME PAGE
+# ============================================================
 
 @app.route("/")
 def home():
@@ -817,19 +1087,48 @@ def home():
     )
 
 
+# ============================================================
+# LOCAL START
+# ============================================================
+
 if __name__ == "__main__":
 
     print()
-    print("==============================================")
-    print(" CoinDCX Futures RSI Scanner")
-    print(" Version 1")
-    print("==============================================")
+
+    print(
+        "=============================================="
+    )
+
+    print(
+        " CoinDCX Futures RSI Scanner"
+    )
+
+    print(
+        " Version 1.1 - Concurrent"
+    )
+
+    print(
+        "=============================================="
+    )
+
     print()
-    print("Open this in your browser:")
+
+    print(
+        "Open this in your browser:"
+    )
+
     print()
-    print("http://127.0.0.1:5000")
+
+    print(
+        "http://127.0.0.1:5000"
+    )
+
     print()
-    print("Press CTRL+C to stop the scanner.")
+
+    print(
+        "Press CTRL+C to stop the scanner."
+    )
+
     print()
 
     app.run(
